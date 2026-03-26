@@ -10,6 +10,7 @@ struct thread_buffer_data {
     int id;
     int time;
 };
+struct thread_buffer_data END_MARKER = {-1, 0};
 
 typedef struct {
     pthread_t *threads;
@@ -20,6 +21,8 @@ typedef struct {
     int tail;
     sem_t producer;
     sem_t consumer;
+    pthread_mutex_t buffer_lock;
+    bool is_done;
     int count;
 } threadpool_t;
 
@@ -31,12 +34,14 @@ threadpool_t *init_threadpool(int num_threads, void *(*producer_work)(void *), v
     pool->buffer = malloc(sizeof(struct thread_buffer_data) * 10);;
     pool->head = 0;
     pool->tail = 0;
-    pool->count = 0;
+    pool->count = 10;
+    pool->is_done = false;
     sem_init(&pool->producer, 0, 10);
     sem_init(&pool->consumer, 0, 0);
+    pthread_mutex_init(&pool->buffer_lock, nullptr);
+
     for (int i = 0; i < num_threads; i++) {
-        int r = rand() % 20;
-        if (r < 5) {
+        if (i < 5) {
             // producer
             pthread_create(&pool->threads[i], NULL, producer_work, (void *)pool);
         } else {
@@ -48,37 +53,64 @@ threadpool_t *init_threadpool(int num_threads, void *(*producer_work)(void *), v
 };
 
 void *grab_data(void *tpool) {
+    int run_count = 500;
     threadpool_t *pool = tpool;
     do{
-    sem_wait(&pool->consumer);
-    struct thread_buffer_data data = pool->buffer[pool->tail];
+
+        sem_wait(&pool->consumer);
+        pthread_mutex_lock(&pool->buffer_lock);
+        struct thread_buffer_data data = pool->buffer[pool->tail];
+        if (data.id <= -1) {
+            sem_post(&pool->consumer);
+            pthread_mutex_unlock(&pool->buffer_lock);
+            printf("[Consumer] Thread %lu: Grabbed data id=%d, sleep=%d \n",
+            pthread_self(), data.id, data.time);
+            return nullptr;
+        };
+
+        pool->tail = (pool->tail + 1) % 10;
+        int temp = pool->tail;
+        pthread_mutex_unlock(&pool->buffer_lock);
         sleep(data.time);
-    printf("[Consumer] Thread %lu: Grabbed data id=%d, sleep=%d from buffer index %d\n",
-       pthread_self(), data.id, data.time, pool->tail);
-    pool->tail = (pool->tail + 1) % 10;
+        printf("[Consumer] Thread %lu: Grabbed data id=%d, sleep=%d from buffer index %d\n",
+        pthread_self(), data.id, data.time, temp);
 
 
-    sem_post(&pool->producer);
+        sem_post(&pool->producer);
     }while (1);
-    return nullptr;
+}
+
+void buffer_add(threadpool_t *pool, bool end_marker) {
+    int r = rand() % 3;
+    struct thread_buffer_data sample_data;
+    sample_data.id = pool->count--;
+    sample_data.time = r;
+    pthread_mutex_lock(&pool->buffer_lock);
+    if (end_marker) {
+        pool->buffer[pool->head] = END_MARKER;
+    } else {
+        pool->buffer[pool->head] = sample_data;
+    }
+    pool->head = (pool->head + 1) % pool->buffer_size;
+    printf("[Producer] Thread %lu: Placed data id=%d, sleep=%d at buffer index %d\n",
+        pthread_self(), sample_data.id, sample_data.time, pool->head);
+    pthread_mutex_unlock(&pool->buffer_lock);
+    sem_post(&pool->consumer);
 }
 
 void *put_data(void *tpool) {
     threadpool_t *pool = tpool;
+    int run_count = 50;
+
     do {
         sem_wait(&pool->producer);
-        int r = rand() % 20;
-        struct thread_buffer_data sample_data;;
-        sample_data.id = pool->count++;
-        sample_data.time = r;
-        pool->buffer[pool->head] = sample_data;
-        printf("[Producer] Thread %lu: Placed data id=%d, sleep=%d at buffer index %d\n",
-            pthread_self(), sample_data.id, sample_data.time, pool->head);
-        pool->head = (pool->head + 1) % 10;
+        if (pool->count <= -1) {
+            buffer_add(pool, true);
+            return nullptr;
+        }
 
-        sem_post(&pool->consumer);
+        buffer_add(pool, false);
     }while (1);
-    return nullptr;
 }
 
 void wait_all_threads(threadpool_t *pool) {
